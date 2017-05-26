@@ -17,6 +17,9 @@
 # RStudio files
 .Rproj.user/
 
+# CSV files
+*.csv
+
 # produced vignettes
 vignettes/*.html
 vignettes/*.pdf
