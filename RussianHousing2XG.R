@@ -1,7 +1,8 @@
 #Russian Housing!
 library(tidyverse)
 library(mice)
-library(randomForest)
+library(xgboost)
+library(Matrix)
 
 setwd("~/Rprojects/russian-housing")
 
@@ -102,10 +103,6 @@ full$year <- substr(full$year, 1, 4)
 full$year <- as.integer(full$year)
 full$build_year[((full$year < full$build_year) & !is.na(full$build_year))] <- NA
 
-#Remove Sub area - too many levels for a factor for RF
-#remove sub_area
-full <- full %>%
-  select(-sub_area)
 
 ### Remove build year prior to 1860
 full$build_year[full$build_year < 1860] <- NA
@@ -123,12 +120,12 @@ View(full)
 grep("product_type", colnames(full))
 full <- full[c(1:6, 181, 185:191, 7:181, 182:184, 192:289)]
 
-full[, 8:14] <- lapply(full[, 8:14], function(x) x/full$cafe_count_1000)
-full[, 8:14]  lapply(full[, 8:14], function(x){ 
+full[, 9:14] <- lapply(full[, 9:14], function(x) x/full$cafe_count_1000)
+full[, 9:14]  lapply(full[, 9:14], function(x){ 
   x[is.nan(x)] <- NA 
   x 
 })
-full[, 8:14] <- lapply(full[, 8:14], function(x){ 
+full[, 9:14] <- lapply(full[, 9:14], function(x){ 
   x[is.na(x)] <- 0 
   x 
 }) 
@@ -142,11 +139,6 @@ ggplot(full[1:30471, ]) +
   geom_hline(yintercept = median(log(train$price_doc)), color = "red") 
 
 #### Let's pause on the cleaning & feature engineering and do some modeling
-#### Let's focus on 1 - 23 vars
-
-full <- full[, 2:23]
-
-
 
 
 #Turn Strings into factors
@@ -156,16 +148,16 @@ var.class <- as.data.frame(var.class)
 var.class <- as.data.frame(t(var.class))
 View(var.class)
 
-#var.class <- var.class %>%
-#  mutate(var = row.names(var.class)) %>%
-#  filter(V1 == 'character') %>%
-#  select(var) 
+var.class <- var.class %>%
+  mutate(var = row.names(var.class)) %>%
+  filter(V1 == 'character') %>%
+  select(var) 
 
 # Turn chr into factors
-#full[var.class$var] <- lapply(full[var.class$var], function(x) as.factor(x))
+full[var.class$var] <- lapply(full[var.class$var], function(x) as.factor(x))
 
 full$product_type <- as.factor(full$product_type)
-
+full$state <- as.factor(full$state)
 str(full)
 
 
@@ -191,15 +183,15 @@ mice.output <- mice::complete(mice_mod)
 
 # Plot histograms for continuous data
 par(mfrow = c(1,2))
-hist(full.mice$state, freq = F, main = 'kitch_sq: Original Data', 
+hist(full$state, freq = F, main = 'kitch_sq: Original Data', 
      col = 'darkgreen', ylim = c(0,0.04))
 hist(mice.output$state, freq = F, main = 'kitch_sq: MICE Output', 
      col = 'lightgreen', ylim = c(0,0.04))
 
 
 par(mfrow = c(1,2))
-barplot(prop.table(table(full.mice$material)))
-barplot(prop.table(table(mice.output$material)))
+barplot(prop.table(table(full$state)))
+barplot(prop.table(table(mice.output$state)))
 
 #vars that have good distro in mice model
 mice.vars.replace <- c("full_sq","life_sq","floor","max_floor", 
@@ -208,53 +200,58 @@ mice.vars.replace <- c("full_sq","life_sq","floor","max_floor",
 
 #put in imputed values for the above variables
 full[, mice.vars.replace] <- mice.output[, mice.vars.replace]
-str(full)
 
-summary(full)
-md.pattern(full)
-View(full)
+missing.vars <- Find.NA.Vars(full)
 
-##Turn material into factor
-full$material <- as.factor(full$material)
+VarWNA <- missing.vars %>%
+  mutate(vars = rownames(missing.vars)) %>%
+  filter(V1 > 0 & vars != 'price_doc') %>%
+  arrange(desc(V1))
 
-## Model Variables
+View(VarWNA)
 
-model.vars <- c("life_sq","floor","max_floor", 
-                "material", "build_year", "num_room", "kitch_sq",
-                "state", "product_type", "timestamp", "cafe_count_1000_price_500",
-                "cafe_count_1000_price_1000",	
-                "cafe_count_1000_price_1500",
-                "cafe_count_1000_price_2500",
-                "cafe_count_1000_price_4000",
-                "cafe_count_1000_price_high",
-                "penthouse", "full_sq")
+#now no more NAs
+full <- full[, !names(full) %in% VarWNA$vars]
 
-#remove data prior to May 1, 2014
-full <- full %>%
-  filter(timestamp >  "2014-05-01")
+#Prep to convert into sparse matrix
+
+var.class <- lapply(full, class)
+var.class <- as.data.frame(var.class)
+var.class <- as.data.frame(t(var.class))
+View(var.class)
+
+var.class <- var.class %>%
+  mutate(var = row.names(var.class)) %>%
+  filter(V1 == 'character') %>%
+  select(var) 
 
 
-train <- full[!is.na(full$price_doc), c(model.vars, "price_doc")]
+# Convert to a matrix
 
-View(train)
-model.rf1 <- randomForest(price_doc ~ ., data = train , ntree = 150, do.trace = 10)
-model.rf2 <- randomForest(price_doc ~ ., data = train , ntree = 500, do.trace = 10)
-#error plot
-plot(model.rf1)
-plot(model.rf2)
+# Splitting back to train and test sets
+train <- full[1:30471, c(1,3:250)]
+test <- full[30472:38133, c(1,4:250)]
 
+
+train.mtx <- sparse.model.matrix(~., data = train)
+test.mtx <- sparse.model.matrix(~., data = test)
+
+
+bst <- xgboost(data = train.mtx[, -c(1, 3)], label = train.mtx[, c(3)],  nthread = 2, nround = 15, verbose = 1)
+
+# Get the feature real names
+names <- dimnames(train.mtx[, -c(1, 3)])[[2]]
+
+# Compute feature importance matrix
+importance_matrix <- xgb.importance(names, model = bst)
+
+# Plotting
 par(mfrow = c(1,1))
-# Variable Importance Plot
-varImpPlot(model.rf1,
-           sort = T,
-           main = "Variable Importance",
-           n.var = 17)
+xgb.plot.importance(importance_matrix)
 
-# Variable Importance Plot
-varImpPlot(model.rf2,
-           sort = T,
-           main = "Variable Importance",
-           n.var = 18)
+# Prediction on test and train sets
+pred_xgboost_test <- predict(bst, test.mtx[, -c(1)])
+pred_xgboost_train <- predict(bst, train[, -c(1)])
 
 results <- as.data.frame(cbind(train$price_doc, model.rf2$predicted))
 results <- results %>%
@@ -264,25 +261,50 @@ results <- results %>%
 
 View(results)
 
-sqrt(mean(results$error^2))
-#Ok, time to predict!
+id.submission <- as.data.frame(full$id[30472:38133])
+submission <- as.data.frame(pred_xgboost_test)
+submission <- bind_cols(id.submission, submission)
 
-test.predict <- full[is.na(full$price_doc), c(model.vars, "price_doc")]
+write.csv(submission, file = 'xg.mod.Solution2-6-4-17.csv', row.names = F)
 
+##Let's try it again with only the most important features
 
+important.vars <- importance_matrix %>%
+  filter(Importance > .0010043172) %>%
+  select(Feature)
 
-prediction <- predict(model.rf2, test.predict)
+full <- full[, names(full) %in% important.vars$Feature]
 
+price.full <- bind_rows(train, test)
+price.full <- select(price.full, price_doc)
+full <- bind_cols(price.full, full)
 
-submission <- as.data.frame(prediction)
-submission <- as.data.frame(cbind(test$id, prediction), col.names = c("id", "price_doc"))
-View(submission)
+# Convert to a matrix
 
-submission <- submission %>%
-  rename(id = V1, price_doc = prediction)
+# Splitting back to train and test sets
+train <- full[1:30471, ]
+test <- full[30472:38133, -c(1)]
 
+train.mtx <- sparse.model.matrix(~., data = train)
+test.mtx <- sparse.model.matrix(~., data = test)
 
-View(submission)
+bst <- xgboost(data = train.mtx[, -c(1:2)], label = train.mtx[, c(2)],  nthread = 2, nround = 15, verbose = 1)
 
+# Get the feature real names
+names <- dimnames(train.mtx[, -c(1, 2)])[[2]]
 
-write.csv(submission, file = "RussianSubmissionMinus-dates-RF1-5-28-17.csv", row.names = FALSE)
+# Compute feature importance matrix
+importance_matrix <- xgb.importance(names, model = bst)
+
+# Plotting
+par(mfrow = c(1,1))
+xgb.plot.importance(importance_matrix)
+
+# Prediction
+pred_xgboost_test <- predict(bst, test.mtx[, -c(1)])
+
+id.submission <- as.data.frame(test$id)
+submission <- as.data.frame(pred_xgboost_test)
+submission <- bind_cols(id.submission, submission)
+
+write.csv(submission, file = 'xg.mod.Solution3-6-4-17.csv', row.names = F)

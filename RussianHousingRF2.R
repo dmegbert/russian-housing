@@ -1,4 +1,5 @@
 #Russian Housing!
+# Use most of all variables
 library(tidyverse)
 library(mice)
 library(randomForest)
@@ -142,11 +143,24 @@ ggplot(full[1:30471, ]) +
   geom_hline(yintercept = median(log(train$price_doc)), color = "red") 
 
 #### Let's pause on the cleaning & feature engineering and do some modeling
-#### Let's focus on 1 - 23 vars
 
-full <- full[, 2:23]
+vars.drop <- VarWNA[VarWNA$V1 > 17, "vars"]
+full <- full[, !names(full) %in% vars.drop]
+
+missing.vars <- Find.NA.Vars(full)
+VarWNA <- missing.vars %>%
+  mutate(vars = rownames(missing.vars)) %>%
+  filter(V1 > 0 & vars != 'price_doc') %>%
+  arrange(desc(V1))
 
 
+full[, VarWNA$vars] <- lapply(
+  full[, VarWNA$vars], 
+    function(x) {
+      x[is.na(x)] <- median(x, na.rm = TRUE)   
+  })
+
+full <- full[, -c(1)]
 
 
 #Turn Strings into factors
@@ -156,13 +170,13 @@ var.class <- as.data.frame(var.class)
 var.class <- as.data.frame(t(var.class))
 View(var.class)
 
-#var.class <- var.class %>%
-#  mutate(var = row.names(var.class)) %>%
-#  filter(V1 == 'character') %>%
-#  select(var) 
+var.class <- var.class %>%
+  mutate(var = row.names(var.class)) %>%
+  filter(V1 == 'character') %>%
+  select(var) 
 
 # Turn chr into factors
-#full[var.class$var] <- lapply(full[var.class$var], function(x) as.factor(x))
+full[var.class$var] <- lapply(full[var.class$var], function(x) as.factor(x))
 
 full$product_type <- as.factor(full$product_type)
 
@@ -210,68 +224,34 @@ mice.vars.replace <- c("full_sq","life_sq","floor","max_floor",
 full[, mice.vars.replace] <- mice.output[, mice.vars.replace]
 str(full)
 
-summary(full)
-md.pattern(full)
-View(full)
+## Split the data back into train and test
+train <- full[1:30471, ]
+test <- full[30472:38133, ]
 
-##Turn material into factor
-full$material <- as.factor(full$material)
-
-## Model Variables
-
-model.vars <- c("life_sq","floor","max_floor", 
-                "material", "build_year", "num_room", "kitch_sq",
-                "state", "product_type", "timestamp", "cafe_count_1000_price_500",
-                "cafe_count_1000_price_1000",	
-                "cafe_count_1000_price_1500",
-                "cafe_count_1000_price_2500",
-                "cafe_count_1000_price_4000",
-                "cafe_count_1000_price_high",
-                "penthouse", "full_sq")
-
-#remove data prior to May 1, 2014
-full <- full %>%
-  filter(timestamp >  "2014-05-01")
-
-
-train <- full[!is.na(full$price_doc), c(model.vars, "price_doc")]
-
-View(train)
-model.rf1 <- randomForest(price_doc ~ ., data = train , ntree = 150, do.trace = 10)
-model.rf2 <- randomForest(price_doc ~ ., data = train , ntree = 500, do.trace = 10)
+model.rf <- randomForest(price_doc ~ ., data = train , ntree = 500, do.trace = 10)
 #error plot
-plot(model.rf1)
-plot(model.rf2)
+plot(model.rf)
 
 par(mfrow = c(1,1))
 # Variable Importance Plot
-varImpPlot(model.rf1,
+varImpPlot(model.rf,
            sort = T,
            main = "Variable Importance",
-           n.var = 17)
+           n.var = 25)
 
-# Variable Importance Plot
-varImpPlot(model.rf2,
-           sort = T,
-           main = "Variable Importance",
-           n.var = 18)
-
-results <- as.data.frame(cbind(train$price_doc, model.rf2$predicted))
+results <- as.data.frame(cbind(train$price_doc, model.rf$predicted))
 results <- results %>%
-  mutate(V1 = log(V1),
-         V2 = log(V2),
-         error = V1 - V2)
+  mutate(V1 = log(V1 + 1),
+         V2 = log(V2 + 1),
+         error = (V1 - V2))
 
 View(results)
 
 sqrt(mean(results$error^2))
 #Ok, time to predict!
 
-test.predict <- full[is.na(full$price_doc), c(model.vars, "price_doc")]
 
-
-
-prediction <- predict(model.rf2, test.predict)
+prediction <- predict(model.rf, test)
 
 
 submission <- as.data.frame(prediction)
@@ -285,4 +265,121 @@ submission <- submission %>%
 View(submission)
 
 
-write.csv(submission, file = "RussianSubmissionMinus-dates-RF1-5-28-17.csv", row.names = FALSE)
+write.csv(submission, file = "RussianSubmissionAllData-RF2-5-29-17.csv", row.names = FALSE)
+
+##Add the macro data
+
+macro <- read.csv(file = "macro.csv")
+View(macro)
+
+#check NAs
+missing.vars <- Find.NA.Vars(full)
+missing.vars <- Find.NA.Vars(macro)
+VarWNA <- missing.vars %>%
+mutate(vars = rownames(missing.vars)) %>%
+filter(V1 > 0 & vars != 'price_doc') %>%
+arrange(desc(V1))
+View(VarWNA)
+
+macro$timestamp <- as.Date(macro$timestamp)
+
+var.class <- lapply(macro, class)
+var.class <- as.data.frame(var.class)
+var.class <- as.data.frame(t(var.class))
+View(var.class)
+
+macro$timestamp <- as.numeric(as.POSIXct(macro$timestamp))
+
+# Set a random seed
+set.seed(432)
+
+# Perform mice imputation, excluding certain less-than-useful variables:
+mice.macro <- mice(macro, m = 3, method = 'rf')  
+
+mice.output <- mice::complete(mice.macro)
+
+# Plot histograms for continuous data
+par(mfrow = c(1,2))
+hist(macro$employment, freq = F, main = 'employment: Original Data', 
+     col = 'darkgreen', ylim = c(0,0.04))
+hist(macro$employment, freq = F, main = 'employment: MICE Output', 
+     col = 'lightgreen', ylim = c(0,0.04))
+
+# grp_growth
+par(mfrow = c(1,2))
+hist(macro$grp_growth, freq = F, main = 'grp_growth: Original Data', 
+     col = 'darkgreen', ylim = c(0,0.04))
+hist(macro$grp_growth, freq = F, main = 'grp_growth: MICE Output', 
+     col = 'lightgreen', ylim = c(0,0.04))
+
+par(mfrow = c(1,2))
+barplot(prop.table(table(full.mice$material)))
+barplot(prop.table(table(mice.output$material)))
+
+#put in imputed values for all of the vars with NAs
+macro[, VarWNA$vars] <- mice.output[, VarWNA$vars]
+
+missing.vars <- Find.NA.Vars(macro)
+
+VarWNA <- missing.vars %>%
+  mutate(vars = rownames(missing.vars)) %>%
+  filter(V1 > 0)
+
+#Get rid of vars that did not get imputed for some reason...
+macro <- macro[, !names(macro) %in% VarWNA$vars]
+
+##Turn timestamp back into Date
+macro$timestamp <- as.Date(as.POSIXct(macro$timestamp, origin = "1970-01-01"))
+
+## Join to full data now that there are no NA
+
+full.macro <- dplyr::inner_join(full, macro, by = "timestamp")
+full.macro <- full.macro[, -c(1)]
+View(full.macro)
+
+## Split the data back into train and test
+train.macro <- full.macro[1:30471, ]
+test.macro <- full.macro[30472:38133, ]
+
+model.rf.macro <- randomForest(price_doc ~ ., data = train.macro , ntree = 500, do.trace = 10)
+
+# Last one - 500 | 7.081e+12    30.99 |
+
+#error plot
+plot(model.rf.macro)
+
+par(mfrow = c(1,1))
+# Variable Importance Plot
+varImpPlot(model.rf.macro,
+           sort = T,
+           main = "Variable Importance",
+           n.var = 30)
+
+results.macro <- as.data.frame(cbind(train.macro$price_doc, model.rf.macro$predicted))
+results.macro <- results.macro %>%
+  mutate(V1 = log(V1 + 1),
+         V2 = log(V2 + 1),
+         error = (V1 - V2))
+
+View(results.macro)
+
+sqrt(mean(results.macro$error^2))
+#Ok, time to predict!
+
+
+prediction.macro <- predict(model.rf.macro, test.macro)
+
+
+submission.macro <- as.data.frame(prediction.macro)
+submission.macro <- as.data.frame(cbind(test$id, prediction.macro), col.names = c("id", "price_doc"))
+View(submission)
+
+submission <- submission %>%
+  rename(id = V1, price_doc = prediction)
+
+
+View(submission)
+
+
+#write.csv(submission, file = "RussianSubmissionAllAndMacroData-RF2-5-30-17.csv", row.names = FALSE)
+
